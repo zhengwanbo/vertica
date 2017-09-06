@@ -1,0 +1,872 @@
+#!/usr/bin/perl
+
+################################################################################
+#
+# Copyright (c) 2012 - 2015 Hewlett Packard Enterprise Development LP 
+#
+#   Script: net_perf
+#   Driver for network performance tests on a group of machines.
+#
+#   Simple usage:
+#       net_perf --hosts host-list
+#   Run with --help for more options. The machine running net_perf
+#   may, but does not need to be one of the hosts being tested.
+#   Requires vnetperf_helper to be built and accessible the driver
+#   machine. vnetperf will copy the helper binary to the test machines
+#   unless the caller specifies its location on those hosts via the
+#   --vertica-install option.
+#
+################################################################################
+
+use strict;
+use warnings;
+
+# Use only perl core modules to ease deployability. Will work on any
+# host with perl version at least 5.7.3
+use Carp;
+use English qw(-no_match_vars);
+use File::Basename;
+use File::Temp qw();
+use FindBin;
+use Getopt::Long qw(:config no_ignore_case);
+use POSIX qw(strftime);
+use Socket;
+
+my $HAS_HIRES = eval
+{
+    require Time::HiRes;
+    Time::HiRes->import();
+    1;
+};
+
+sub timestamp {
+    my ($tsec, $tusec);
+
+    if ($HAS_HIRES) {
+        ($tsec, $tusec) = Time::HiRes::gettimeofday();
+    } else {
+        ($tsec, $tusec) = (time(), 0);
+    }
+
+    return sprintf("%s,%03d",
+                   strftime("%F_%H:%M:%S", localtime($tsec)),
+                   int($tusec / 1000));
+}
+
+my $ADMIN_TOOLS    = "/opt/vertica/bin/admintools";
+my $BINARY         = "vnetperf_helper";
+my $MAX_HOSTS      = 1000; #one can dream
+
+my $TIME_STAMP     = timestamp();
+my $DEFAULT_LOGDIR = "./logs.vnetperf.$TIME_STAMP";
+my $WORK_DIR       = "/tmp/vnetperf.$TIME_STAMP";
+my $LOCAL_BINARY   = "$FindBin::Bin/$BINARY";
+my $REMOTE_BINARY  = "$WORK_DIR/$BINARY";
+my $SLAVE_LOGFILE  = "$WORK_DIR/slavelog";
+my $PORTSTRING;
+
+my @IPLIST;
+my @TESTS_TO_RUN;
+my @CLEANUPS;
+my %ALL_TESTS;
+
+my $DEBUG  = 0;
+my $INFO   = 1;
+my $WARN   = 2;
+my $ERROR  = 3;
+
+my %logLevels = (
+    $DEBUG  => "DEBUG",
+    $INFO   => "INFO",
+    $WARN   => "WARN",
+    $ERROR  => "ERROR",
+    );
+
+my %DEFAULT_OPTS = (
+    condense     => 0,
+    collectLogs  => 0,
+    datarate     => 0,
+    duration     => 1,
+    hosts        => undef,
+    ignoreBad    => 0,
+    logDir       => $DEFAULT_LOGDIR,
+    logLevel     => $WARN,
+    ports        => "14159,14160,14161",
+    resultsFile  => "./results.$TIME_STAMP.json",
+    sshOpts      => "-x",
+    scpOpts      => "",
+    vertInstall  => undef,
+    );
+
+my %OPTS = %DEFAULT_OPTS;
+
+# Python script template; PY_HOSTNAME must be replaced by a literal string before the script is
+# invoked.  Returns a formatted IPv6 address if either 1) PY_HOSTNAME is a domain name resolvable 
+# via DNS or hosts file lookup; or 2) PY_HOSTNAME already contains a correctly formatted numeric
+# IPv6 address.  Otherwise, the empty string is returned.
+# Workaround for the lack of IPv6 library support in Perl 5.10/5.12 core.
+my $py_getaddr6_code = <<'END_PY_GETADDR6';
+import socket
+try: 
+    for res in socket.getaddrinfo(PY_HOSTNAME, 0, socket.AF_INET6, socket.SOCK_DGRAM, 0, 0):
+        af, socktype, proto, canonname, sockaddr = res
+        addr, port, flowinfo, scope_id = sockaddr
+        if scope_id == 0: print addr  # we're not interested in link-local addresses
+except:
+    pass
+print ''  # no configured IPv6 address
+END_PY_GETADDR6
+
+sub logDebug  { logMsg($DEBUG,  @_) }
+sub logInfo   { logMsg($INFO,   @_) }
+sub logWarn   { logMsg($WARN,   @_) }
+sub logError  { logMsg($ERROR,  @_) }
+
+sub toBoolStr {
+    return ($1 ? "true" : "false");
+}
+
+sub usage {
+    my $prog = basename($0);
+    print("Usage: $prog [--help] [options] [tests-to-run...]\n");
+    print("Where tests-to-run is a list of tests from (default is all):\n");
+    foreach my $test (sort (keys %ALL_TESTS)) {
+        print("    $test\n");
+    }
+    print("\n");
+    print("Options:\n");
+    print("    --condense                     If true, and condense the json results to one line per entry (default="
+          . toBoolStr($DEFAULT_OPTS{condense}) . ")\n");
+    print("    --collect-logs                 If true, gather the test log files from the hosts (default="
+          . toBoolStr($DEFAULT_OPTS{collectLogs}) . ")\n");
+    print("    --datarate rate                Limit bandwidth test speeds to the specified rate in MB/s\n");
+    print("                                   A value of zero will loop through a range of different rates (default=$DEFAULT_OPTS{datarate})\n");
+    print("    --duration seconds             Time limit for each test run (default=$DEFAULT_OPTS{duration})\n");
+    print("    --hosts host1,host2,...,hostn  At least two hosts to use for the test\n");
+    print("    --hosts file                   A file listing the hosts to use for the test\n");
+    print("                                   delimited by newlines, commas and whitespace\n");
+    print("                                   On a vertica installation, if no hosts are specified,\n");
+    print("                                   all known hosts in the cluster will be used\n");
+    print("    --identity-file file           Any identity file to supply to ssh, scp\n");
+    print("    --ignore-bad-hosts             If true, run the test on the reachable hosts even if some are not (default="
+          . toBoolStr($DEFAULT_OPTS{ignoreBad}) . ")\n");
+    print("    --log-dir directory            If collect-logs is set, the directory to place the debug\n");
+    print("                                   log files (default=logs.netperf.<timestamp>)\n");
+    print("    --log-level LEVEL              One of ". join(", ", (values %logLevels)) . " (default=$logLevels{$DEFAULT_OPTS{logLevel}})\n");
+    print("    --list-tests                   List the tests that can be run\n");
+    print("    --output-file file             The file to write json results to (default=results.<timestamp>.json,\n");
+    print("                                   in the working directory)\n");
+    print("    --ports port1,port2,port3      The three port numbers to use: if only one is specifed, the next two\n");
+    print("                                   numbers in sequence are assumed (default=$DEFAULT_OPTS{ports})\n");
+    print("    --scp-options options          Any scp-options to use when connecting to the hosts\n");
+    print("    --ssh-options options          Any ssh-options to use when connecting to the hosts\n");
+    print("    --vertica-install directory    If provided, assume the test binaries alread exist on the hosts in the specified directory\n");
+    print("    --address-family               IP address family (4 or 6) to be used for testing (4 is the default if only non-numeric hostnames are provided)\n" );
+}
+
+sub assertNumArgs {
+    my ($expectedNum, @args) = @_;
+    my $actualNum = scalar(@args);
+    if ($actualNum != $expectedNum) {
+        my $args = join(", ", @args);
+        croak("INTERNAL ERROR: unexpected number of arguments "
+              . "$actualNum instead of $expectedNum: $args");
+    }
+    return @args;
+}
+
+sub assertDefined {
+    my ($val, $context) = assertNumArgs(2, @_);
+    if (!defined($val)) {
+        croak("INTERNAL ERROR $context: not defined");
+    }
+}
+
+sub assertArrayRef {
+    my ($val) = assertNumArgs(1, @_);
+    if (ref($val) ne "ARRAY") {
+        croak("INTERNAL ERROR: expected array");
+    }
+}
+
+sub logMsg {
+    my ($level, $msg) = assertNumArgs(2, @_);
+    my $levelName = $logLevels{$level};
+    assertDefined($levelName, "INTERNAL ERROR: unknown log level");
+    if ($level >= $OPTS{logLevel}) {
+        printf(STDERR "%s %5s: %s\n", timestamp(), $levelName, $msg);
+    }
+}
+
+sub getTempFile {
+    assertNumArgs(0, @_);
+    my $tmp = new File::Temp(TEMPLATE => "netperfXXXXXX",
+                             DIR => "/tmp",
+                             UNLINK => 0);
+    push(@CLEANUPS, sub { unlink($tmp->filename()); });
+    return $tmp;
+}
+
+sub runSystemCommand {
+    my $cmd = join(" ", @_);
+    logDebug("runSystemCommand '$cmd'");
+    my $outTmp = getTempFile()->filename();
+    my $errTmp = getTempFile()->filename();
+    my $retval = system("$cmd >$outTmp 2>$errTmp");
+    my $childError = $CHILD_ERROR;
+    my $stdout = `cat $outTmp`;
+    my $stderr = `cat $errTmp`;
+    my $output = "";
+    if ($stdout) {
+        $output .= "\n[ stdout =\n$stdout]";
+    }
+    if ($stderr) {
+        $output .= "\n[ stderr =\n$stderr]";
+    }
+    if ($retval != 0) {
+        if ($childError == -1) {
+            logDebug("Could not execute command: '$cmd': $ERRNO: $output");
+        } elsif ($childError & 127) {
+            my $signal = ($childError & 127);
+            my $core   = (($childError & 128) ? 'with' : 'without');
+            logDebug("Command '$cmd' died with signal $signal, "
+                     . " $core coredump: $output");
+        } else {
+            $retval = $childError >> 8;
+            logDebug("Command '$cmd' exited with value $retval: $output");
+        }
+    }
+    return {
+        cmd          => $cmd,
+        retval       => $retval,
+        stdout       => $stdout,
+        stderr       => $stderr,
+        wrappedOuput => $output,
+    };
+}
+
+sub assertSystemCommand {
+    my $result = runSystemCommand(@_);
+    if ($result->{retval} != 0) {
+        croak("Command $result->{cmd} failed: $result->{output}");
+    }
+    return $result;
+}
+
+sub runRemoteCommand {
+    my ($host, @cmd) = @_;
+    assertDefined($host, "remote host");
+    my $cmd = "ssh $OPTS{sshOpts} $host " . join(" ", @cmd);
+    logDebug("runRemoteCommand '$cmd'");
+    return system($cmd);
+}
+
+sub checkTests {
+    foreach my $test (@TESTS_TO_RUN) {
+        if (!$ALL_TESTS{$test}) {
+            logError("unknown test: $test. valid tests are:\n"
+                     . join("\n", (sort (keys %ALL_TESTS))));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+sub checkHosts {
+    my @hostList;
+    my @rejects;
+
+    if (!defined($OPTS{hosts})) {
+        if ( ! -e $ADMIN_TOOLS ) {
+            logError("No hosts specified and $ADMIN_TOOLS cannot be found");
+            usage();
+            return 0;
+        }
+        logInfo("No hosts specified...trying to guess with admintools.");
+        # XXX: -i is a huge hack. It's an old and not documented argument that
+        # prevents the EULA acceptance from being shown on the screen. Just
+        # does the work anyway.
+        my $status = runSystemCommand("$ADMIN_TOOLS -i -t list_host");
+        if ($status->{retval} == 0) {
+            $OPTS{hosts} = $status->{stdout};
+            chomp($OPTS{hosts});
+        } else {
+            logError("Couldn't determine hosts via admintools: "
+                     . "$status->{stderr}");
+            return 0;
+        }
+    }
+
+    if ($OPTS{hosts} !~ m/,| /) {
+        logInfo("One entry for hosts, assuming hosts are in file $OPTS{hosts}");
+        my $fh;
+        if (!open($fh, "<", "$OPTS{hosts}")) {
+            logError("Couldn't open file $OPTS{hosts}: $ERRNO");
+            logError("Please specify at least two "
+                     . "hosts via command-line or a file");
+            return 0;
+        }
+
+        # Add in hosts delimited by newline or comma
+        # grep { /\S/ } filters out any whitespace
+        while (my $line = <$fh>) {
+            push(@hostList, grep { /\S/ } split(/,| |\n/, $line));
+            if (@hostList> $MAX_HOSTS) {
+                logError("Suspiciously large number (%d) of hosts "
+                         . "in $OPTS{hosts}", scalar(@hostList));
+                return 0;
+            }
+
+        }
+    } else {
+        @hostList = split(/,| |\n/, $OPTS{hosts});
+    }
+
+    # resolve the hostnames to IP addresses (populate two lists with IPv4 and IPv6 addressses
+    # respectively, unless the address family was specified on the command line).
+    # Note that an incoming hostname can be a preformatted IP address.
+    my (@resolvedIPv4, @rejectedIPv4);
+    my (@resolvedIPv6, @rejectedIPv6);
+    foreach my $host (@hostList) {
+        my $addr;
+        my $ip;
+        if ($OPTS{addrFamily} != 6) {
+            # try IPv4 address resolution
+            $addr = gethostbyname($host);
+            $ip = inet_ntoa($addr) if ($addr);
+            if ($ip) {
+                if (grep {$ip eq $_} (@resolvedIPv4)) {
+                    logError("IP $ip of host $host is a duplicate");
+                    return 0;
+                }
+                push(@resolvedIPv4, $ip);
+            }
+            else {
+                push (@rejectedIPv4, $host);
+            }
+        }
+        if ($OPTS{addrFamily} != 4) {
+            # try IPv6 address resolution
+            my $py_getaddr6_local = $py_getaddr6_code;
+            $py_getaddr6_local =~ s/PY_HOSTNAME/'$host'/;
+            $ip = qx/python -c "$py_getaddr6_local"/;
+            $ip =~ s/\s+//;  # trim whitespace
+            if ($ip) {
+                if (grep {$ip eq $_} (@resolvedIPv6)) {
+                    logError("IP $ip of host $host is a duplicate");
+                    return 0;
+                }
+                if ($ip =~ /^fe[89ab]/i) {
+                    logWarn("Connecting with link-local IPv6 address $ip for host $host is not supported");
+                    $ip = '';
+                }
+            }
+            if ($ip) {
+                push(@resolvedIPv6, $ip);
+            }
+            else {
+                push (@rejectedIPv6, $host);
+            }
+        }
+    }
+
+    # If the --address-family option was not specified, determine the IP address family
+    # implied by the set of hostnames we got (IPv4 is the default).
+    # Note: a mixture of IPv4 and IPv6 host addresses is not supported.
+    if (!$OPTS{addrFamily}) {
+        if (scalar(@resolvedIPv4) >= scalar(@resolvedIPv6)) {  # default is IPv4
+            $OPTS{addrFamily} = 4;
+        } 
+        else {
+            $OPTS{addrFamily} = 6;
+        }
+        logInfo("Assuming IP address family: " . $OPTS{addrFamily});
+    }
+    if ($OPTS{addrFamily} == 4) {
+        @IPLIST = @resolvedIPv4;
+        @rejects = @rejectedIPv4;
+    }
+    else {
+        @IPLIST = @resolvedIPv6;
+        @rejects = @rejectedIPv6;
+    }
+
+    if (@rejects) {
+        my $family = $OPTS{addrFamily};
+        if ($OPTS{ignoreBad}) {
+            logWarn("Ignoring unresolvable hosts (assuming IPv$family): @rejects");
+        } else {
+            logError("Exiting because of unresolvable hosts (assuming IPv$family): @rejects");
+            return 0;
+        }
+    }
+
+    if (@IPLIST < 2) {
+        logError("Need at least two resolvable hosts to run test");
+        return 0;
+    }
+
+    my $testStr = (@TESTS_TO_RUN > 0 ? join(" ", @TESTS_TO_RUN): "default");
+    logDebug("Tests to run: $testStr");
+    logDebug("Hosts: "        . join(" ", @hostList));
+    logDebug("IP addresses: " . join(" ", @IPLIST));
+    if (@rejects) {
+        logDebug("Rejects: "      . join(" ", @rejects));
+    }
+
+    if ($OPTS{vertInstall}) {
+        if (0 != runRemoteCommand($IPLIST[0], "test -e $REMOTE_BINARY")) {
+            logError("Can't find $REMOTE_BINARY on $IPLIST[0]");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+# enclose IPv6 addresses in brackets; keep IPv4 addresses as is
+sub presentationHost {
+    my ($host) = @_;
+    return ($OPTS{addrFamily} == 6) ? ('[' . $host . ']') : $host;
+}
+
+sub runOnHosts {
+    my ($code, $hosts) = assertNumArgs(2, @_);  
+    ::assertArrayRef($hosts);
+    my $tasks = AsyncSub::startTasks($code, [map { [ $_ ] } @{$hosts} ]);
+    AsyncSub::waitForTasks($tasks);
+}
+
+sub killTest {
+    my @hosts = @_;
+    logDebug("Killing $BINARY processes hard");
+    my $code = sub {
+        my ($host) = assertNumArgs(1, @_);
+        runRemoteCommand($host, "pkill -9 $BINARY");
+    };
+    runOnHosts($code, \@hosts);
+}
+
+sub setupTest {
+    killTest(@IPLIST);
+
+    #Start slave on all hosts.
+    my $opts="";
+    if ($OPTS{addrFamily} == 4) {
+        $opts .= " -4";
+    }
+    elsif ($OPTS{addrFamily} == 6) {
+        $opts .= " -6";
+    }
+    my $code = sub {
+        my ($host) = assertNumArgs(1, @_);
+        my $presentHost=presentationHost($host);
+        logDebug("Setting up test on $host");
+        runRemoteCommand($host,  "mkdir -p $WORK_DIR");
+        if (!$OPTS{vertInstall}) {
+            my $cmd = "scp $OPTS{scpOpts} $LOCAL_BINARY $presentHost:$REMOTE_BINARY";
+            assertSystemCommand($cmd);
+        }
+        logDebug("Starting slave on $presentHost");
+        runRemoteCommand($host,
+                         "'$REMOTE_BINARY -s $PORTSTRING $opts "
+                         . "-l $logLevels{$OPTS{logLevel}} "
+                         . "&> $SLAVE_LOGFILE &'");
+    };
+    runOnHosts($code, \@IPLIST);
+    #xxx check that slaves have started
+}
+
+sub cleanupTest {
+    killTest(@IPLIST);
+
+    my $code = sub {
+        my ($host) = assertNumArgs(1, @_);
+        my $presentHost=presentationHost($host);
+        my $c = "ssh $OPTS{sshOpts} $host grep ERROR $SLAVE_LOGFILE 2>/dev/null";
+        my @slaveErrors = split("\n", `$c`);
+        @slaveErrors = grep {  s/^/    $presentHost: / } @slaveErrors;
+        if (@slaveErrors) {
+            logError("host $presentHost errors found:\n" . join("\n", @slaveErrors));
+        }
+        if ($OPTS{collectLogs}) {
+            my $localSlaveLog = "$OPTS{logDir}/slave.$host.log";
+            my $c2 = "scp $OPTS{scpOpts} $presentHost:$SLAVE_LOGFILE $localSlaveLog";
+            my $status = runSystemCommand($c2);
+            if ($status->{retval} != 0) {
+                logError("Could not save logs from host $presentHost. Command "
+                         . "'$status->{cmd}' failed: $status->{wrappedOuput}");
+            }
+        }
+        runRemoteCommand($host, "rm -rf $WORK_DIR");
+    };
+    runOnHosts($code, \@IPLIST);
+
+    foreach my $cleanupSub (@CLEANUPS) {
+        &$cleanupSub();
+    }
+}
+
+sub runTest {
+    #Start master on this host.
+    my $tmp = getTempFile();
+    print $tmp join("\n", @IPLIST);
+    my $opts = "$PORTSTRING -m " . $tmp->filename();
+    $opts .= " -f $OPTS{resultsFile} -l $logLevels{$OPTS{logLevel}}";
+    if ($OPTS{condense}) {
+        $opts .= " -c";
+    }
+    if ($OPTS{datarate}) {
+        $opts .= " -r $OPTS{datarate}";
+    }
+    if ($OPTS{duration}) {
+        $opts .= " -d $OPTS{duration}";
+    }
+    if ($OPTS{addrFamily} == 4) {
+        $opts .= " -4";
+    }
+    elsif ($OPTS{addrFamily} == 6) {
+        $opts .= " -6";
+    }
+    my $args = join(" ", @TESTS_TO_RUN);
+    my $cmd = "$LOCAL_BINARY $opts $args";
+    logDebug("Starting test: $cmd");
+    if (system($cmd) != 0) {
+        logDebug("Test failed: $CHILD_ERROR");
+    } else {
+        logDebug("Done test");
+    }
+}
+
+sub main {
+    my $logLevelStr;
+    my $help;
+    my $listTests;
+    my $idFile;
+    my $runSelfTest = 0;
+    if (!GetOptions(
+             'condense'          => \$OPTS{condense},
+             'collect-logs'      => \$OPTS{collectLogs},
+             'datarate=i'        => \$OPTS{datarate},
+             'duration=i'        => \$OPTS{duration},
+             'help'              => \$help,
+             'hosts=s'           => \$OPTS{hosts},
+             'identity-file=s'   => \$idFile,
+             'ignore-bad-hosts'  => \$OPTS{ignoreBad},
+             'log-level=s'       => \$logLevelStr,
+             'list-tests'        => \$listTests,
+             'log-dir=s'         => \$OPTS{logDir},
+             'output-file=s'     => \$OPTS{resultsFile},
+             'ports=s'           => \$OPTS{ports},
+             'self-test'         => \$runSelfTest,
+             'ssh-options=s'     => \$OPTS{sshOpts},
+             'scp-options=s'     => \$OPTS{scpOpts},
+             'vertica-install=s' => \$OPTS{vertInstall},
+             'address-family=i'  => \$OPTS{addrFamily})) {
+        usage();
+        exit(1);
+    }
+
+    if (defined($logLevelStr)) {
+        my ($logLevel)
+            = grep { $logLevels{$_} eq $logLevelStr } (keys %logLevels);
+        if (defined($logLevel)) {
+            $OPTS{logLevel} = $logLevel;
+        } else {
+            logError("Unknown log-level: $logLevelStr");
+            usage();
+            exit(1);
+        }
+    }
+
+    if ($OPTS{datarate} < 0) {
+        logError("Datarate cannot be negative: $OPTS{datarate}");
+        usage();
+        exit(1);
+    }
+
+    if ($OPTS{duration} <= 0) {
+        logError("Duration must be positive: $OPTS{duration}");
+        usage();
+        exit(1);
+    }
+
+    my @ports = split(",", $OPTS{ports});
+    if (scalar(@ports) != 3 && scalar(@ports) != 1) {
+        logError("Wrong number of ports: $OPTS{ports}. Specify 3 ports or "
+                 . "start of 3-port range");
+        usage();
+        exit(1);
+    }
+    if (scalar(@ports) == 1) {
+        logInfo("Only one port specified will use the next two");
+        push(@ports, $ports[0] + 1, $ports[0] + 2);
+    }
+    my @badPorts = grep { $_ <= 1024 || $_ > 65535 } @ports;
+    if (scalar(@badPorts) > 0) {
+        logError("Some ports outside of allowable range 1025-65535: "
+                 . join(",", @badPorts));
+        usage();
+        exit(1);
+    }
+    logInfo("Using ports ". join(", ", @ports));
+    $PORTSTRING = "-p $ports[0] -u $ports[1] -v $ports[2]";
+
+    if (defined($OPTS{addrFamily})) {
+        if ($OPTS{addrFamily} != 4 && $OPTS{addrFamily} != 6) {
+            logError("Address family must be either 4 or 6");
+            usage();
+            exit(1);
+        }
+    }
+    else {  # avoid "undefined key" grief later
+        $OPTS{addrFamily} = 0;
+    }
+
+    if (defined($OPTS{vertInstall})) {
+        $REMOTE_BINARY = "$OPTS{vertInstall}/$BINARY";
+        logDebug("Assuiming $BINARY installed on hosts at $REMOTE_BINARY");
+        if (! -e $LOCAL_BINARY) {
+            logDebug("Couldn't find $BINARY locally at $LOCAL_BINARY. "
+                     . "Checking install location $REMOTE_BINARY");
+            $LOCAL_BINARY = $REMOTE_BINARY;
+        }
+    }
+
+    if (! -e $LOCAL_BINARY) {
+        logError("binary $BINARY not found locally at $LOCAL_BINARY");
+        exit(1);
+    }
+
+    # get the list of tests
+    my $tests = assertSystemCommand("$LOCAL_BINARY -t")->{stdout};
+    map { $ALL_TESTS{$_}++ } (split("\n", $tests));
+
+    if ($help) {
+        usage();
+        exit(0);
+    }
+
+    if ($listTests) {
+        print("Available tests:\n" . join("\n", (keys %ALL_TESTS)) . "\n");
+        exit(0);
+    }
+
+    if ($OPTS{collectLogs} && (system("mkdir -p $OPTS{logDir}") != 0)) {
+        logError("Couldn't make log directory $OPTS{logDir}: $ERRNO");
+        exit(1);
+    }
+
+    if ($idFile) {
+        $OPTS{sshOpts} .= " -i $idFile";
+        $OPTS{scpOpts} .= " -i $idFile";
+    }
+
+    if ($runSelfTest) {
+        logInfo("Running internal tests");
+        testAsyncSub();
+        logInfo("Tests PASSED");
+        exit(0);
+    }
+
+    @TESTS_TO_RUN = @ARGV;
+    if (!checkTests()) {
+        exit(1);
+    }
+
+    if (!checkHosts()) {
+        exit(1);
+    }
+
+    setupTest();
+    eval {
+        runTest();
+    };
+    if ($EVAL_ERROR) {
+        logError("Test failure: $EVAL_ERROR");
+    }
+    cleanupTest();
+}
+
+
+{
+    ####################################################################
+    # Utility class to fork off child processes to execute perl code.
+    # The code can return any serializable perl structure back to the
+    # parent when it is done. This should properly be a separate module,
+    # but is included here to simplify the deployment of net_perf.
+    # There is no shared memory so any state updates to the parent
+    # will not get propagated to the child process. Care must be taken
+    # to avoid using this with destructor code could release external
+    # resources the parent is using, such as open file descriptors.
+    #
+    # Usage:
+    #
+    # my $code = sub { <do something>; return { a => $a, b => $b } };
+    # my $task = AsyncSub->new(code => $code);
+    # $task->start();
+    # if ($task->poll()) {
+    #   print("task still running\n");
+    # }
+    # $task->wait();
+    # my $result = $task->result(); # there is an implicit wait in result
+    # print("a is $result->{a}\n");
+    #
+    ####################################################################
+    package AsyncSub;
+
+    use Carp;
+    use Storable;
+    use English qw(-no_match_vars);
+    use POSIX qw(WNOHANG);
+
+    sub new {
+        my $proto = shift;
+        my $class = ref($proto) || $proto;
+        my $self = { @_ };
+        if (ref($self->{code}) ne "CODE") {
+            croak("INTERNAL ERROR: Async sub created without coderef");
+        }
+        bless ($self, $class);
+        return $self;
+    }
+
+    sub start {
+        my ($self) = ::assertNumArgs(1, @_);    
+        if ($self->{child_pid}) {
+            croak("ERROR: Async sub already started");
+        }
+        $self->{statusFile} = ::getTempFile()->filename();
+        my $pid = fork();
+        if (!defined($pid)) {
+            croak("INTERNAL ERROR: could't fork $ERRNO");
+        } elsif ($pid == 0) {
+            # child
+            my $ret;
+            eval {
+                $ret = $self->{code}(@{$self->{args}});
+            };
+            my $errStr = $EVAL_ERROR;
+            my $ok = ($errStr ? 0 : 1);
+            my $storeOk = store({ ok     => $ok,
+                                  errStr => $errStr,
+                                  ret    => $ret },
+                                $self->{statusFile});
+            if (!$storeOk) {
+                ::logError("Couldn't serialize result "
+                           . "to $self->{statusFile}: $ERRNO");
+            }
+            exit($ok);
+        } else {
+            # parent
+            $self->{child_pid} = $pid;
+            return $self;
+        }
+    }
+
+    sub poll {
+        my ($self) = ::assertNumArgs(1, @_);    
+        if (!$self->{child_pid}) {
+            return 0;
+        }
+
+        # reap any children that have exited
+        waitpid($self->{child_pid}, WNOHANG);
+
+        my $count = kill(0, $self->{child_pid});
+        return ($count == 1);
+    }
+
+    sub wait {
+        my ($self) = ::assertNumArgs(1, @_);    
+        if (!$self->{child_pid}) {
+            return;
+        }
+        waitpid($self->{child_pid}, 0);
+        $self->{child_pid} = undef;
+    }
+
+    sub result {
+        my ($self) = ::assertNumArgs(1, @_);    
+        $self->wait();
+
+        my $status = retrieve($self->{statusFile});
+        if (!$status) {
+            ::logError("Couldn't read result "
+                       . "from $self->{statusFile}: $ERRNO");
+        }
+
+        if (!$status->{ok}) {
+            my $msg = "Async command failed";
+            if ($status->{errStr}) {
+                $msg .= $status->{errStr};
+            }
+            croak($msg);
+        }
+        return $status->{ret};
+    }
+
+    sub waitForTasks {
+        my ($tasks) = ::assertNumArgs(1, @_);   
+        ::assertArrayRef($tasks);
+        foreach my $t (@{$tasks}) {
+            $t->wait();
+        }
+    }
+
+    sub startTasks {
+        my ($code, $argsLists) = ::assertNumArgs(2, @_);        
+        ::assertArrayRef($argsLists);
+        my @tasks;
+        foreach my $args (@{$argsLists}) {
+            ::assertArrayRef($args);
+            my $task = AsyncSub->new(code => $code,
+                                     args => $args);
+            push(@tasks, $task->start());
+        }    
+        return \@tasks;
+    }
+}
+
+sub assertGE {
+    my ($actual, $bound, $ctx) = assertNumArgs(3, @_);  
+    if ($actual < $bound) {
+        croak("$ctx: value '$actual' not greater than or equal to lower"
+              . " bound '$bound'");
+    }
+}
+
+sub assertEqualNum {
+    my ($actual, $ref, $ctx) = assertNumArgs(3, @_);    
+    if ($ref != $actual) {
+        croak("$ctx: value '$actual' not equal to expected '$ref'");
+    }
+}
+
+sub assertEqualStr {
+    my ($actual, $ref, $ctx) = assertNumArgs(3, @_);    
+    if ($ref ne $actual) {
+        croak("$ctx: value '$actual' not equal to expected '$ref'");
+    }
+}
+
+sub testAsyncSub {
+    my $code = sub {
+        system("sleep 3");
+        return { string => "FOOBAR", num => 3.14 };
+    };
+
+    my $task = AsyncSub->new(code => $code);
+    $task->start();
+    my $count = 0;
+    while ($task->poll()) {
+        $count++;
+        logDebug("Waiting on child task $task->{child_pid}\n");
+        sleep(1);
+    }
+    my $res = $task->result();
+    assertGE($count, 2, "seconds slept");
+    assertEqualStr($res->{string}, "FOOBAR", "value one");
+    assertEqualNum($res->{num}, 3.14 , "value two");
+}
+
+main();
