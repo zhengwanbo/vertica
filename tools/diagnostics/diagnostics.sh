@@ -69,7 +69,6 @@ runscript "if [ -f '/etc/grub.conf' ]; then /bin/cat /etc/grub.conf; fi"
 runscript "set"
 
 runscript "if [ -f '/etc/profile' ]; then /bin/cat /etc/profile; fi"
-runscript "if [ -f '/etc/profile.d/vertica.sh' ]; then /bin/cat /etc/profile.d/vertica.sh; fi"
 runscript "if [ -f '/root/.bash_profile' ]; then /bin/cat /root/.bash_profile; fi"
 runscript "if [ -f '/home/dbadmin/.bash_profile' ]; then /bin/cat /home/dbadmin/.bash_profile; fi"
 

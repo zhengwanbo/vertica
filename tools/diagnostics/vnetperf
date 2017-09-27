@@ -14,7 +14,6 @@
 #   Requires vnetperf_helper to be built and accessible the driver
 #   machine. vnetperf will copy the helper binary to the test machines
 #   unless the caller specifies its location on those hosts via the
-#   --vertica-install option.
 #
 ################################################################################
 
@@ -53,7 +52,7 @@ sub timestamp {
                    int($tusec / 1000));
 }
 
-my $ADMIN_TOOLS    = "/opt/vertica/bin/admintools";
+my $ADMIN_TOOLS    = "/opt/pingcap/bin/admintools";
 my $BINARY         = "vnetperf_helper";
 my $MAX_HOSTS      = 1000; #one can dream
 
@@ -145,7 +144,7 @@ sub usage {
     print("    --hosts host1,host2,...,hostn  At least two hosts to use for the test\n");
     print("    --hosts file                   A file listing the hosts to use for the test\n");
     print("                                   delimited by newlines, commas and whitespace\n");
-    print("                                   On a vertica installation, if no hosts are specified,\n");
+    print("                                   On a pingcap installation, if no hosts are specified,\n");
     print("                                   all known hosts in the cluster will be used\n");
     print("    --identity-file file           Any identity file to supply to ssh, scp\n");
     print("    --ignore-bad-hosts             If true, run the test on the reachable hosts even if some are not (default="
@@ -160,7 +159,7 @@ sub usage {
     print("                                   numbers in sequence are assumed (default=$DEFAULT_OPTS{ports})\n");
     print("    --scp-options options          Any scp-options to use when connecting to the hosts\n");
     print("    --ssh-options options          Any ssh-options to use when connecting to the hosts\n");
-    print("    --vertica-install directory    If provided, assume the test binaries alread exist on the hosts in the specified directory\n");
+    print("    --pingcap-install directory    If provided, assume the test binaries alread exist on the hosts in the specified directory\n");
     print("    --address-family               IP address family (4 or 6) to be used for testing (4 is the default if only non-numeric hostnames are provided)\n" );
 }
 
@@ -560,7 +559,7 @@ sub main {
              'self-test'         => \$runSelfTest,
              'ssh-options=s'     => \$OPTS{sshOpts},
              'scp-options=s'     => \$OPTS{scpOpts},
-             'vertica-install=s' => \$OPTS{vertInstall},
+             'pingcap-install=s' => \$OPTS{vertInstall},
              'address-family=i'  => \$OPTS{addrFamily})) {
         usage();
         exit(1);

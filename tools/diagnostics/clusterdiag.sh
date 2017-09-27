@@ -29,29 +29,24 @@ runscript ()
   rm -rf $ScriptDir/_tmpcmd.sh
 }
 
-
 cat /dev/null > $LOGFILE
 
-
-
 if [ "X$NODE_LIST" = "X" ]; then
-  # NODE_LIST="v001 v002 v003 v004 v005 v006 v007 v008 v009 v010 v011 v012 v013 v014 v015 v016"
   NODE_LIST="v001 v002 v003 v004 v005 v006 v007 v008"
-  # NODE_LIST="v009 v010 v011 v012 v013 v014 v015 v016"
 fi
 SELF=`hostname`
 
 # diagnostics 
 for s in $NODE_LIST; do
   echo start diag on $s ...
-  ssh -n $s "nohup $ScriptDir/diagnostics.sh $LOGFILE.$s >/dev/null 2>&1" &
+  ssh -i $sshauth -n $s "nohup $ScriptDir/diagnostics.sh $LOGFILE.$s >/dev/null 2>&1" &
 done
 wait
 
 # get result 
 for s in $NODE_LIST; do
   showcmd diagnostics infos of $s
-  ssh $s "cat $LOGFILE.$s" >>$LOGFILE
+  ssh -i $sshauth $s "cat $LOGFILE.$s" >>$LOGFILE
 done
 
 
